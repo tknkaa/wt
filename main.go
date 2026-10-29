@@ -3,6 +3,7 @@
 //	wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
 //	wt list                    worktree の一覧
 //	wt clean [-y]              マージ済みの worktree とブランチを削除する
+//	wt prune [-y]              clean に加え、close された PR やリモートが消えたブランチも削除する
 package main
 
 import (
@@ -21,6 +22,7 @@ const usage = `usage:
   wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
   wt list                    worktree の一覧
   wt clean [-y]              マージ済みの worktree とブランチを削除する
+  wt prune [-y]              clean に加え、close された PR やリモートが消えたブランチも削除する
 
 リポジトリ固有の後処理は git config wt.setup に書く(worktree 内で sh -c で実行する)。
   例: git config wt.setup "pnpm wrangler d1 migrations apply app --local"
@@ -46,7 +48,9 @@ func main() {
 	case "list", "ls":
 		err = run("", "git", "worktree", "list")
 	case "clean":
-		err = cmdClean(len(args) > 0 && (args[0] == "-y" || args[0] == "--yes"))
+		err = cmdClean(len(args) > 0 && (args[0] == "-y" || args[0] == "--yes"), false)
+	case "prune":
+		err = cmdClean(len(args) > 0 && (args[0] == "-y" || args[0] == "--yes"), true)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -256,10 +260,18 @@ type candidate struct {
 	reason string
 }
 
-func cmdClean(yes bool) error {
+// prune はマージされていないブランチも消すため、clean とは分けて明示的に選ばせる
+func cmdClean(yes, prune bool) error {
 	root, _, err := repoRoot()
 	if err != nil {
 		return err
+	}
+	if prune {
+		// ディレクトリを手で消した worktree が残るとブランチが checkout 中扱いになり消せないため、先に登録を外す。
+		// 消えるのは git の管理情報だけなので確認は挟まない
+		if err := run(root, "git", "worktree", "prune", "--verbose"); err != nil {
+			return err
+		}
 	}
 	// リモートで消えたブランチの参照を残すと、マージ済みかどうかの判定がずれるため先に整理する
 	if err := run(root, "git", "fetch", "--prune", "--quiet"); err != nil {
@@ -281,7 +293,7 @@ func cmdClean(yes bool) error {
 		pathOf[w.branch] = w.path
 	}
 
-	merged, err := mergedPRHeads(root)
+	prs, err := prHeads(root)
 	if err != nil {
 		return err
 	}
@@ -303,11 +315,17 @@ func cmdClean(yes bool) error {
 		var reason string
 		// squash マージでは main の履歴に元のコミットが残らないため、PR の先頭コミットと一致するかで見る。
 		// 一致しなければマージ後に積んだコミットがあるので消さない
-		if pr, ok := merged[name]; ok && pr.oid == sha {
+		pr, hasPR := prs[name]
+		if hasPR && pr.merged && pr.oid == sha {
 			reason = fmt.Sprintf("PR #%d merged", pr.number)
 		} else if gone && ancestor(root, sha, "origin/"+def) {
 			// 作ったばかりでコミットの無いブランチも main の祖先になるため、push 済みでリモートが消えたものに限る
 			reason = "merged into origin/" + def
+		} else if prune && hasPR && !pr.merged && pr.oid == sha {
+			// close 後に積んだコミットは作業を再開したものとみなし、PR の先頭と一致するものだけ消す
+			reason = fmt.Sprintf("PR #%d closed", pr.number)
+		} else if prune && gone {
+			reason = "remote gone"
 		} else {
 			continue
 		}
@@ -357,35 +375,38 @@ func cmdClean(yes bool) error {
 	return run(root, "git", "worktree", "prune")
 }
 
-type mergedPR struct {
+type pullRequest struct {
 	number int
 	oid    string
+	merged bool
 }
 
-func mergedPRHeads(root string) (map[string]mergedPR, error) {
+// closed には merged も含まれるため、一度の呼び出しで両方を得る
+func prHeads(root string) (map[string]pullRequest, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
 		fmt.Fprintln(os.Stderr, "wt: gh が無いため、squash マージされた PR は判定できない")
-		return map[string]mergedPR{}, nil
+		return map[string]pullRequest{}, nil
 	}
-	out, err := output(root, "gh", "pr", "list", "--state", "merged", "--limit", "500", "--json", "number,headRefName,headRefOid")
+	out, err := output(root, "gh", "pr", "list", "--state", "closed", "--limit", "500", "--json", "number,headRefName,headRefOid,state")
 	if err != nil {
 		// GitHub 以外のリモートでも通常のマージ判定だけは使えるよう、失敗しても続ける
 		fmt.Fprintln(os.Stderr, "wt: gh pr list が失敗したため、PR での判定はしない:", err)
-		return map[string]mergedPR{}, nil
+		return map[string]pullRequest{}, nil
 	}
 	var prs []struct {
 		Number      int    `json:"number"`
 		HeadRefName string `json:"headRefName"`
 		HeadRefOid  string `json:"headRefOid"`
+		State       string `json:"state"`
 	}
 	if err := json.Unmarshal([]byte(out), &prs); err != nil {
 		return nil, err
 	}
-	m := map[string]mergedPR{}
+	m := map[string]pullRequest{}
 	for _, p := range prs {
 		// 同じブランチ名で複数回 PR を出した場合は新しいもの(先に返る)を使う
 		if _, ok := m[p.HeadRefName]; !ok {
-			m[p.HeadRefName] = mergedPR{p.Number, p.HeadRefOid}
+			m[p.HeadRefName] = pullRequest{p.Number, p.HeadRefOid, p.State == "MERGED"}
 		}
 	}
 	return m, nil
