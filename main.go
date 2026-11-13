@@ -2,8 +2,7 @@
 //
 //	wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
 //	wt list                    worktree の一覧
-//	wt clean [-y]              マージ済みの worktree とブランチを削除する
-//	wt prune [-y]              clean に加え、close された PR やリモートが消えたブランチも削除する
+//	wt clean [-y] [--gone]     マージ済み・close 済みの PR の worktree とブランチを削除する
 package main
 
 import (
@@ -21,8 +20,8 @@ import (
 const usage = `usage:
   wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
   wt list                    worktree の一覧
-  wt clean [-y]              マージ済みの worktree とブランチを削除する
-  wt prune [-y]              clean に加え、close された PR やリモートが消えたブランチも削除する
+  wt clean [-y] [--gone]     マージ済み・close 済みの PR の worktree とブランチを削除する
+                             --gone でリモートが消えただけのブランチも削除する
 
 リポジトリ固有の後処理は git config wt.setup に書く(worktree 内で sh -c で実行する)。
   例: git config wt.setup "pnpm wrangler d1 migrations apply app --local"
@@ -48,9 +47,11 @@ func main() {
 	case "list", "ls":
 		err = run("", "git", "worktree", "list")
 	case "clean":
-		err = cmdClean(len(args) > 0 && (args[0] == "-y" || args[0] == "--yes"), false)
+		err = cleanWithArgs(args, false)
 	case "prune":
-		err = cmdClean(len(args) > 0 && (args[0] == "-y" || args[0] == "--yes"), true)
+		// 旧コマンドで実行しても動くようにしつつ、clean へ寄せるため移行を促す
+		fmt.Fprintln(os.Stderr, "wt: prune は廃止予定。wt clean --gone を使う")
+		err = cleanWithArgs(args, true)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -260,18 +261,31 @@ type candidate struct {
 	reason string
 }
 
-// prune はマージされていないブランチも消すため、clean とは分けて明示的に選ばせる
-func cmdClean(yes, prune bool) error {
+func cleanWithArgs(args []string, gone bool) error {
+	yes := false
+	for _, a := range args {
+		switch a {
+		case "-y", "--yes":
+			yes = true
+		case "--gone":
+			gone = true
+		default:
+			return fmt.Errorf("unknown option: %s\nusage: wt clean [-y] [--gone]", a)
+		}
+	}
+	return cmdClean(yes, gone)
+}
+
+// --gone はマージも close もされていないブランチまで消すため、明示したときだけ対象にする
+func cmdClean(yes, gone bool) error {
 	root, _, err := repoRoot()
 	if err != nil {
 		return err
 	}
-	if prune {
-		// ディレクトリを手で消した worktree が残るとブランチが checkout 中扱いになり消せないため、先に登録を外す。
-		// 消えるのは git の管理情報だけなので確認は挟まない
-		if err := run(root, "git", "worktree", "prune", "--verbose"); err != nil {
-			return err
-		}
+	// ディレクトリを手で消した worktree が残るとブランチが checkout 中扱いになり消せないため、先に登録を外す。
+	// 消えるのは git の管理情報だけなので確認は挟まない
+	if err := run(root, "git", "worktree", "prune", "--verbose"); err != nil {
+		return err
 	}
 	// リモートで消えたブランチの参照を残すと、マージ済みかどうかの判定がずれるため先に整理する
 	if err := run(root, "git", "fetch", "--prune", "--quiet"); err != nil {
@@ -308,7 +322,7 @@ func cmdClean(yes, prune bool) error {
 		if len(f) < 2 {
 			continue
 		}
-		name, sha, gone := f[0], f[1], strings.Contains(line, "[gone]")
+		name, sha, remoteGone := f[0], f[1], strings.Contains(line, "[gone]")
 		if name == def || pathOf[name] == "-" {
 			continue
 		}
@@ -318,13 +332,13 @@ func cmdClean(yes, prune bool) error {
 		pr, hasPR := prs[name]
 		if hasPR && pr.merged && pr.oid == sha {
 			reason = fmt.Sprintf("PR #%d merged", pr.number)
-		} else if gone && ancestor(root, sha, "origin/"+def) {
+		} else if remoteGone && ancestor(root, sha, "origin/"+def) {
 			// 作ったばかりでコミットの無いブランチも main の祖先になるため、push 済みでリモートが消えたものに限る
 			reason = "merged into origin/" + def
-		} else if prune && hasPR && !pr.merged && pr.oid == sha {
+		} else if hasPR && !pr.merged && pr.oid == sha {
 			// close 後に積んだコミットは作業を再開したものとみなし、PR の先頭と一致するものだけ消す
 			reason = fmt.Sprintf("PR #%d closed", pr.number)
-		} else if prune && gone {
+		} else if gone && remoteGone {
 			reason = "remote gone"
 		} else {
 			continue
