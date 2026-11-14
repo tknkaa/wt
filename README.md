@@ -11,7 +11,7 @@ go install github.com/tknkaa/wt@latest
 ```sh
 wt new feat/foo [<start>]  # .worktree/feat-foo に作る。start 省略時は origin の既定ブランチ
 wt list
-wt clean [-y] [--gone]     # マージ済み・close 済みの PR の worktree とブランチを確認してから削除
+wt clean [-y] [--gone]     # open ではない PR に紐づく worktree とブランチを確認してから削除
 ```
 
 `wt new` は worktree を作ったあとに次を行う。
@@ -27,10 +27,11 @@ git config wt.setup "pnpm wrangler d1 migrations apply app --local"
 
 `wt clean` が消すのは次のいずれかに当たるブランチ。
 
-- マージ済み PR の先頭コミットとブランチの先頭が一致する(squash マージ向け。`gh` が要る)
-- close された PR の先頭コミットとブランチの先頭が一致する(close 後にコミットを積んだものは残す)
+- マージ済みか close された PR がある(`gh` が要る)。PR に載っていないコミットがあっても消すので、一覧で `+未 PR のコミット` と出たものは確認する
 - リモートのブランチが消えていて、`origin/<既定ブランチ>` に含まれる
 - `--gone` を付けたときだけ、リモートのブランチが消えたもの(マージされていなくても消す)
+
+open な PR があるブランチは、上のどれに当たっても消さない。
 
 tracked な未コミットの変更がある worktree は消さない。ディレクトリを手で消した worktree の登録は、確認なしで外す。
 

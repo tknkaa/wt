@@ -2,7 +2,7 @@
 //
 //	wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
 //	wt list                    worktree の一覧
-//	wt clean [-y] [--gone]     マージ済み・close 済みの PR の worktree とブランチを削除する
+//	wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
 package main
 
 import (
@@ -20,7 +20,7 @@ import (
 const usage = `usage:
   wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
   wt list                    worktree の一覧
-  wt clean [-y] [--gone]     マージ済み・close 済みの PR の worktree とブランチを削除する
+  wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
                              --gone でリモートが消えただけのブランチも削除する
 
 リポジトリ固有の後処理は git config wt.setup に書く(worktree 内で sh -c で実行する)。
@@ -327,17 +327,25 @@ func cmdClean(yes, gone bool) error {
 			continue
 		}
 		var reason string
-		// squash マージでは main の履歴に元のコミットが残らないため、PR の先頭コミットと一致するかで見る。
-		// 一致しなければマージ後に積んだコミットがあるので消さない
 		pr, hasPR := prs[name]
-		if hasPR && pr.merged && pr.oid == sha {
-			reason = fmt.Sprintf("PR #%d merged", pr.number)
+		if hasPR && pr.open {
+			// 作業中のブランチなので、ほかの条件に当たっても消さない
+			continue
+		}
+		if hasPR {
+			// PR が閉じたらそのブランチの作業は終わったとみなし、先頭コミットが PR と違っても消す。
+			// ただし PR に載っていないコミットは消えると戻せないため、一覧で分かるようにする
+			state := "closed"
+			if pr.merged {
+				state = "merged"
+			}
+			reason = fmt.Sprintf("PR #%d %s", pr.number, state)
+			if pr.oid != sha {
+				reason += " (+未 PR のコミット)"
+			}
 		} else if remoteGone && ancestor(root, sha, "origin/"+def) {
 			// 作ったばかりでコミットの無いブランチも main の祖先になるため、push 済みでリモートが消えたものに限る
 			reason = "merged into origin/" + def
-		} else if hasPR && !pr.merged && pr.oid == sha {
-			// close 後に積んだコミットは作業を再開したものとみなし、PR の先頭と一致するものだけ消す
-			reason = fmt.Sprintf("PR #%d closed", pr.number)
 		} else if gone && remoteGone {
 			reason = "remote gone"
 		} else {
@@ -381,7 +389,7 @@ func cmdClean(yes, gone bool) error {
 				return err
 			}
 		}
-		// squash マージだと git からは未マージに見えて -d が拒否されるため -D を使う。上で PR の先頭と一致することを確かめている
+		// squash マージだと git からは未マージに見えて -d が拒否されるため -D を使う。対象は一覧で確認を取っている
 		if err := run(root, "git", "branch", "-D", c.branch); err != nil {
 			return err
 		}
@@ -393,15 +401,16 @@ type pullRequest struct {
 	number int
 	oid    string
 	merged bool
+	open   bool
 }
 
-// closed には merged も含まれるため、一度の呼び出しで両方を得る
+// open な PR があるブランチを対象から外すため、closed だけでなくすべての状態を得る
 func prHeads(root string) (map[string]pullRequest, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
 		fmt.Fprintln(os.Stderr, "wt: gh が無いため、squash マージされた PR は判定できない")
 		return map[string]pullRequest{}, nil
 	}
-	out, err := output(root, "gh", "pr", "list", "--state", "closed", "--limit", "500", "--json", "number,headRefName,headRefOid,state")
+	out, err := output(root, "gh", "pr", "list", "--state", "all", "--limit", "1000", "--json", "number,headRefName,headRefOid,state")
 	if err != nil {
 		// GitHub 以外のリモートでも通常のマージ判定だけは使えるよう、失敗しても続ける
 		fmt.Fprintln(os.Stderr, "wt: gh pr list が失敗したため、PR での判定はしない:", err)
@@ -418,9 +427,12 @@ func prHeads(root string) (map[string]pullRequest, error) {
 	}
 	m := map[string]pullRequest{}
 	for _, p := range prs {
-		// 同じブランチ名で複数回 PR を出した場合は新しいもの(先に返る)を使う
-		if _, ok := m[p.HeadRefName]; !ok {
-			m[p.HeadRefName] = pullRequest{p.Number, p.HeadRefOid, p.State == "MERGED"}
+		pr := pullRequest{p.Number, p.HeadRefOid, p.State == "MERGED", p.State == "OPEN"}
+		cur, ok := m[p.HeadRefName]
+		// 同じブランチ名で複数回 PR を出した場合、1 つでも open なら作業中なので open を優先する。
+		// それ以外は新しいもの(先に返る)を使う
+		if !ok || (pr.open && !cur.open) {
+			m[p.HeadRefName] = pr
 		}
 	}
 	return m, nil
