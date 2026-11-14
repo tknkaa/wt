@@ -1,8 +1,8 @@
-// wt は git worktree の作成と、マージ済みブランチの片付けを行う。
+// gh wt は git worktree の作成と、マージ済みブランチの片付けを行う。
 //
-//	wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
-//	wt list                    worktree の一覧
-//	wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
+//	gh wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
+//	gh wt list                    worktree の一覧
+//	gh wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
 package main
 
 import (
@@ -18,9 +18,9 @@ import (
 )
 
 const usage = `usage:
-  wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
-  wt list                    worktree の一覧
-  wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
+  gh wt new <branch> [<start>]  worktree を作り、.env をコピーして依存をインストールする
+  gh wt list                    worktree の一覧
+  gh wt clean [-y] [--gone]     open ではない PR に紐づく worktree とブランチを削除する
                              --gone でリモートが消えただけのブランチも削除する
 
 リポジトリ固有の後処理は git config wt.setup に書く(worktree 内で sh -c で実行する)。
@@ -36,7 +36,7 @@ func main() {
 	switch args := os.Args[2:]; os.Args[1] {
 	case "new":
 		if len(args) < 1 || len(args) > 2 {
-			err = errors.New("usage: wt new <branch> [<start>]")
+			err = errors.New("usage: gh wt new <branch> [<start>]")
 			break
 		}
 		start := ""
@@ -50,7 +50,7 @@ func main() {
 		err = cleanWithArgs(args, false)
 	case "prune":
 		// 旧コマンドで実行しても動くようにしつつ、clean へ寄せるため移行を促す
-		fmt.Fprintln(os.Stderr, "wt: prune は廃止予定。wt clean --gone を使う")
+		fmt.Fprintln(os.Stderr, "gh wt: prune は廃止予定。gh wt clean --gone を使う")
 		err = cleanWithArgs(args, true)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -59,7 +59,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "wt:", err)
+		fmt.Fprintln(os.Stderr, "gh wt:", err)
 		os.Exit(1)
 	}
 }
@@ -270,7 +270,7 @@ func cleanWithArgs(args []string, gone bool) error {
 		case "--gone":
 			gone = true
 		default:
-			return fmt.Errorf("unknown option: %s\nusage: wt clean [-y] [--gone]", a)
+			return fmt.Errorf("unknown option: %s\nusage: gh wt clean [-y] [--gone]", a)
 		}
 	}
 	return cmdClean(yes, gone)
@@ -407,13 +407,13 @@ type pullRequest struct {
 // open な PR があるブランチを対象から外すため、closed だけでなくすべての状態を得る
 func prHeads(root string) (map[string]pullRequest, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
-		fmt.Fprintln(os.Stderr, "wt: gh が無いため、squash マージされた PR は判定できない")
+		fmt.Fprintln(os.Stderr, "gh wt: gh が無いため、squash マージされた PR は判定できない")
 		return map[string]pullRequest{}, nil
 	}
 	out, err := output(root, "gh", "pr", "list", "--state", "all", "--limit", "1000", "--json", "number,headRefName,headRefOid,state")
 	if err != nil {
 		// GitHub 以外のリモートでも通常のマージ判定だけは使えるよう、失敗しても続ける
-		fmt.Fprintln(os.Stderr, "wt: gh pr list が失敗したため、PR での判定はしない:", err)
+		fmt.Fprintln(os.Stderr, "gh wt: gh pr list が失敗したため、PR での判定はしない:", err)
 		return map[string]pullRequest{}, nil
 	}
 	var prs []struct {
